@@ -1149,7 +1149,8 @@ window.townsImpactedLabel = townsImpactedLabel;
 
 // RainViewer/radar state and slider removed
 
-const VOLTADAR_ALERTS_API = 'https://a8890-c7a1.e.jrnm.app/eventstream';
+const VOLTADAR_ALERTS_HTTP_API = 'https://warnverlaynwwsalerts.dpdns.org/alerts';
+const VOLTADAR_ALERTS_WS_API = 'wss://warnverlaynwwsalerts.dpdns.org/ws';
 
 window.__voltadarAlertsSseHealthy = false;
 window.__voltadarAlertsEventSource = null;
@@ -1239,7 +1240,7 @@ function normalizeAlertsPayload(data) {
 
 async function fetchActiveAlertsHttp() {
   try {
-    const response = await fetch(VOLTADAR_ALERTS_API);
+    const response = await fetch(VOLTADAR_ALERTS_HTTP_API);
     if (!response.ok) throw new Error(`Voltadar alerts HTTP ${response.status}`);
     const data = await response.json();
     const normalized = { features: normalizeAlertsPayload(data) };
@@ -1270,7 +1271,7 @@ async function fetchActiveAlertsData() {
 function loadVoltadarAlertsForInitialBootstrap() {
   return new Promise((resolve, reject) => {
     let settled = false;
-    let sse = null;
+    let ws = null;
     let watchdogTimer = null;
 
     function cleanupWatchdog() {
@@ -1284,9 +1285,9 @@ function loadVoltadarAlertsForInitialBootstrap() {
       if (settled) return;
       settled = true;
       cleanupWatchdog();
-      if (sse) {
-        try { sse.close(); } catch (_) {}
-        sse = null;
+      if (ws) {
+        try { ws.close(); } catch (_) {}
+        ws = null;
       }
       window.__voltadarAlertsEventSource = null;
       window.__voltadarAlertsSseHealthy = false;
@@ -1295,37 +1296,38 @@ function loadVoltadarAlertsForInitialBootstrap() {
     }
 
     watchdogTimer = setTimeout(() => {
-      finishViaHttp('[alerts] Voltadar SSE snapshot timeout; using HTTP');
+      finishViaHttp('[alerts] Voltadar WebSocket snapshot timeout; using HTTP');
     }, 12000);
 
-    if (typeof EventSource === 'undefined') {
+    if (typeof WebSocket === 'undefined') {
       finishViaHttp(null);
       return;
     }
 
     try {
-      sse = new EventSource(VOLTADAR_ALERTS_API);
-      window.__voltadarAlertsEventSource = sse;
-      console.log('[SSE] EventSource opened for:', VOLTADAR_ALERTS_API);
+      ws = new WebSocket(VOLTADAR_ALERTS_WS_API);
+      window.__voltadarAlertsEventSource = ws;
+      console.log('[WS] WebSocket opened for:', VOLTADAR_ALERTS_WS_API);
 
-      const handleVoltadarSseEvent = (ev) => {
-        console.log('[SSE] Raw event received:', { type: ev.type, dataLength: (ev.data || '').length, dataPreview: (ev.data || '').substring(0, 200) });
-        
+      const handleVoltadarWsMessage = (ev) => {
+        const dataStr = typeof ev?.data === 'string' ? ev.data : String(ev?.data ?? '');
+        console.log('[WS] Raw message received:', { dataLength: dataStr.length, dataPreview: dataStr.substring(0, 200) });
+
         let snap = null;
         try {
-          snap = ingestVoltadarSsePayloadString(ev.data);
+          snap = ingestVoltadarSsePayloadString(dataStr);
         } catch (parseErr) {
-          console.error('[SSE] Failed to parse payload:', parseErr, 'rawData:', ev.data);
-          return;
-        }
-        
-        console.log('[SSE] Parsed payload:', snap);
-        if (!snap || !Array.isArray(snap.features)) {
-          console.warn('[SSE] Invalid snapshot structure or no features');
+          console.error('[WS] Failed to parse payload:', parseErr, 'rawData:', dataStr);
           return;
         }
 
-        console.log('[SSE] Valid features count:', snap.features.length);
+        console.log('[WS] Parsed payload:', snap);
+        if (!snap || !Array.isArray(snap.features)) {
+          console.warn('[WS] Invalid snapshot structure or no features');
+          return;
+        }
+
+        console.log('[WS] Valid features count:', snap.features.length);
         window.nwsAlertFeatures = snap.features;
         window.__voltadarAlertsSseHealthy = true;
 
@@ -1335,7 +1337,7 @@ function loadVoltadarAlertsForInitialBootstrap() {
           resolve(snap);
           // Also process immediately for UI
           if (typeof window.pollNwsAlerts === 'function') {
-            console.debug('[SSE] Calling pollNwsAlerts immediately after SSE bootstrap');
+            console.debug('[WS] Calling pollNwsAlerts immediately after WebSocket bootstrap');
             window.pollNwsAlerts(snap);
           }
           return;
@@ -1343,30 +1345,29 @@ function loadVoltadarAlertsForInitialBootstrap() {
 
         try {
           if (typeof window.pollNwsAlerts === 'function') {
-            console.debug('[SSE] Calling pollNwsAlerts for live SSE update with', snap.features.length, 'features');
+            console.debug('[WS] Calling pollNwsAlerts for live WebSocket update with', snap.features.length, 'features');
             window.pollNwsAlerts(snap);
           }
         } catch (e) {
-          console.warn('[alerts] merge after Voltadar SSE snapshot failed', e);
+          console.warn('[alerts] merge after Voltadar WebSocket snapshot failed', e);
         }
       };
 
-      sse.onopen = () => {
-        console.log('[SSE] Connection established');
+      ws.onopen = () => {
+        console.log('[WS] Connection established');
       };
-      
-      sse.onmessage = handleVoltadarSseEvent;
-      sse.addEventListener('alert', handleVoltadarSseEvent);
 
-      sse.onerror = () => {
+      ws.onmessage = handleVoltadarWsMessage;
+
+      ws.onerror = () => {
         if (!settled) {
-          finishViaHttp('[alerts] Voltadar SSE failed before bootstrap; using HTTP fetch');
+          finishViaHttp('[alerts] Voltadar WebSocket failed before bootstrap; using HTTP fetch');
           return;
         }
-        console.warn('[alerts] Voltadar SSE connection lost; reverting to HTTP polling');
+        console.warn('[alerts] Voltadar WebSocket connection lost; reverting to HTTP polling');
         window.__voltadarAlertsSseHealthy = false;
-        try { sse.close(); } catch (_) {}
-        sse = null;
+        try { ws.close(); } catch (_) {}
+        ws = null;
         window.__voltadarAlertsEventSource = null;
         try {
           if (typeof window.pollNwsAlerts === 'function') {
@@ -1385,8 +1386,20 @@ function loadVoltadarAlertsForInitialBootstrap() {
           }
         } catch (_) {}
       };
+
+      ws.onclose = () => {
+        if (!settled) {
+          finishViaHttp('[alerts] Voltadar WebSocket closed before bootstrap; using HTTP fetch');
+          return;
+        }
+        console.warn('[alerts] Voltadar WebSocket connection closed; reverting to HTTP polling');
+        window.__voltadarAlertsSseHealthy = false;
+        try { ws.close(); } catch (_) {}
+        ws = null;
+        window.__voltadarAlertsEventSource = null;
+      };
     } catch (e) {
-      finishViaHttp('[alerts] Voltadar SSE unavailable: ' + (e && e.message));
+      finishViaHttp('[alerts] Voltadar WebSocket unavailable: ' + (e && e.message));
     }
   });
 }
