@@ -7,45 +7,6 @@
   const zoneGeometryCache = {}; // Add this line for caching
   const zoneGeometryInFlight = {}; // Tracks in-progress fetches so concurrent callers share one request
 
-  function simplifyGeometry(geometry) {
-    if (!geometry || typeof geometry !== 'object') return geometry;
-
-    const simplifyRing = (ring) => {
-      if (!Array.isArray(ring) || ring.length < 12) return ring;
-      const maxPoints = 140;
-      const step = Math.max(1, Math.floor(ring.length / maxPoints));
-      const simplified = [];
-      for (let i = 0; i < ring.length; i += step) {
-        simplified.push(ring[i]);
-      }
-      const lastPoint = ring[ring.length - 1];
-      const lastSaved = simplified[simplified.length - 1];
-      if (!lastSaved || JSON.stringify(lastSaved) !== JSON.stringify(lastPoint)) {
-        simplified.push(lastPoint);
-      }
-      return simplified;
-    };
-
-    if (geometry.type === 'Polygon' && Array.isArray(geometry.coordinates)) {
-      return {
-        ...geometry,
-        coordinates: geometry.coordinates.map((ring) => simplifyRing(ring))
-      };
-    }
-
-    if (geometry.type === 'MultiPolygon' && Array.isArray(geometry.coordinates)) {
-      return {
-        ...geometry,
-        coordinates: geometry.coordinates.map((polygon) => {
-          if (!Array.isArray(polygon)) return polygon;
-          return polygon.map((ring) => simplifyRing(ring));
-        })
-      };
-    }
-
-    return geometry;
-  }
-
   async function rateLimitedFetch(url, fetcher) {
     return new Promise((resolve, reject) => {
       const task = async () => {
@@ -74,9 +35,75 @@
   }
 
   async function fetchZoneGeometryUncached(ugc) {
+    const getZoneGeometryFromResponse = (json) => {
+      if (!json || typeof json !== 'object') return null;
+      if (json.geometry) return json.geometry;
+      if (Array.isArray(json.features) && json.features.length > 0) {
+        const geometries = json.features
+          .map((feature) => feature && feature.geometry)
+          .filter(Boolean);
+        if (geometries.length === 0) return null;
+        if (geometries.length === 1) return geometries[0];
+        if (typeof window !== 'undefined' && window.turf && typeof window.turf.union === 'function' && typeof window.turf.feature === 'function') {
+          try {
+            return geometries.reduce((merged, geometry) => {
+              if (!merged) return geometry;
+              const unioned = window.turf.union(window.turf.feature(merged), window.turf.feature(geometry));
+              return unioned && unioned.geometry ? unioned.geometry : merged;
+            }, null);
+          } catch (e) {
+            console.warn('[alerts] turf.union failed on FeatureCollection geometry merge', e);
+          }
+        }
+        const coords = [];
+        geometries.forEach((geometry) => {
+          if (geometry.type === 'Polygon') coords.push(geometry.coordinates);
+          else if (geometry.type === 'MultiPolygon') coords.push(...geometry.coordinates);
+        });
+        return coords.length ? { type: 'MultiPolygon', coordinates: coords } : null;
+      }
+      return null;
+    };
+
     // Decide endpoint order based on the UGC type character.
     // UGC format is typically: <STATE><TYPE><NUMBER> e.g. VAZ123 or VAC045
     // TYPE 'Z' => forecast zones, TYPE 'C' => county zones
+    const getGeometryFromResponse = (json) => {
+      if (!json || typeof json !== 'object') return null;
+      if (json.geometry) return json.geometry;
+
+      if (Array.isArray(json.features) && json.features.length > 0) {
+        const geometries = json.features
+          .map(feature => feature && feature.geometry)
+          .filter(Boolean);
+        if (geometries.length === 0) return null;
+        if (geometries.length === 1) return geometries[0];
+
+        if (typeof window !== 'undefined' && window.turf && typeof window.turf.union === 'function' && typeof window.turf.feature === 'function') {
+          try {
+            const merged = geometries.reduce((current, geometry) => {
+              if (!current) return geometry;
+              const unioned = window.turf.union(window.turf.feature(current), window.turf.feature(geometry));
+              return unioned && unioned.geometry ? unioned.geometry : current;
+            }, null);
+            if (merged) return merged;
+          } catch (e) {
+            console.warn('[alerts] turf.union failed while merging FeatureCollection geometries', e);
+          }
+        }
+
+        const coords = [];
+        geometries.forEach((geometry) => {
+          if (!geometry || !geometry.type) return;
+          if (geometry.type === 'Polygon') coords.push(geometry.coordinates);
+          else if (geometry.type === 'MultiPolygon') coords.push(...geometry.coordinates);
+        });
+        return coords.length ? { type: 'MultiPolygon', coordinates: coords } : null;
+      }
+
+      return null;
+    };
+
     const urlsFor = {
       forecast: `https://api.weather.gov/zones/forecast/${ugc}`,
       county: `https://api.weather.gov/zones/county/${ugc}`,
@@ -115,17 +142,10 @@
           continue; // Try next URL
         }
 
-        // Response can be a Feature or FeatureCollection
-        let geometry = null;
-        if (json && json.geometry) geometry = json.geometry;
-        if (json && Array.isArray(json.features) && json.features[0] && json.features[0].geometry) {
-          geometry = json.features[0].geometry;
-        }
-
+        const geometry = getGeometryFromResponse(json);
         if (geometry) {
-          const simplifiedGeometry = simplifyGeometry(geometry);
-          zoneGeometryCache[ugc] = simplifiedGeometry; // Cache the fetched geometry
-          return simplifiedGeometry;
+          zoneGeometryCache[ugc] = geometry;
+          return geometry;
         }
       } catch (networkError) {
         console.warn(`Network error fetching ${url}:`, networkError);
@@ -166,17 +186,24 @@
     if (!props) return [];
     const ugcs = new Set();
 
+    const normalizeZoneCode = (value) => {
+      if (!value) return null;
+      const cleaned = String(value).trim().toUpperCase();
+      const match = cleaned.match(/[A-Z]{2}[A-Z0-9]{1,3}\d{3}/);
+      if (match) return match[0];
+      const fallback = cleaned.match(/[A-Z0-9]{3,6}/);
+      return fallback ? fallback[0] : null;
+    };
+
     const addCodes = (item) => {
       if (!item) return;
       if (Array.isArray(item)) {
         for (const v of item) addCodes(v);
         return;
       }
-      // item may be a single string that contains multiple codes separated by
-      // spaces, commas, or semicolons. Split and normalize each token.
-      const parts = String(item).split(/[\s,;]+/);
+      const parts = String(item).split(/[\s,;\/|]+/);
       for (const p of parts) {
-        const code = String(p || '').trim().toUpperCase();
+        const code = normalizeZoneCode(p);
         if (code) ugcs.add(code);
       }
     };
@@ -185,9 +212,11 @@
     if (Array.isArray(props.affectedZones)) {
       for (const url of props.affectedZones) {
         try {
-          const parts = String(url).split('/');
-          const id = parts.pop() || parts.pop();
-          if (id) ugcs.add(id.toUpperCase());
+          const path = String(url).split('?')[0].split('#')[0];
+          const parts = path.split('/').filter(Boolean);
+          const id = parts.length ? parts[parts.length - 1] : null;
+          const code = normalizeZoneCode(id);
+          if (code) ugcs.add(code);
         } catch (e) { /* ignore */ }
       }
     }
